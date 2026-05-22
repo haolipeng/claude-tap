@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import webbrowser
@@ -256,9 +257,7 @@ async def run_client(
 
     cmd_args = list(extra_args)
     cmd_args = _maybe_rewrite_hermes_gateway_start(client, cmd_args)
-    has_base_url_config_override = bool(
-        cfg.base_url_config_key and _has_config_override(cmd_args, cfg.base_url_config_key)
-    )
+    base_url_config_overrides = _base_url_config_overrides(client, cfg, port, cmd_args)
 
     if proxy_mode == "forward":
         proxy_url = f"http://127.0.0.1:{port}"
@@ -304,11 +303,11 @@ async def run_client(
         env["NO_PROXY"] = "127.0.0.1"
         if cfg.inject_settings_env and not _has_settings_arg(cmd_args):
             cmd_args = _settings_arg(reverse_env) + cmd_args
-        if cfg.base_url_config_key and not has_base_url_config_override:
+        if base_url_config_overrides:
             # Some clients ignore their base URL env in selected auth/transport modes
             # unless the same value is also supplied as a config override.
-            base_url = cfg.reverse_base_url(port)
-            cmd_args = ["-c", f'{cfg.base_url_config_key}="{base_url}"'] + cmd_args
+            for override in reversed(base_url_config_overrides):
+                cmd_args = ["-c", override] + cmd_args
 
     for key in cfg.nesting_env_keys:
         env.pop(key, None)
@@ -491,6 +490,29 @@ def _has_config_override(args: list[str], key: str) -> bool:
                 return True
         i += 1
     return False
+
+
+def _base_url_config_overrides(client: str, cfg: ClientConfig, port: int, args: list[str]) -> list[str]:
+    """Return native CLI config overrides needed to route traffic via reverse proxy."""
+    if not cfg.base_url_config_key:
+        return []
+
+    base_url = cfg.reverse_base_url(port)
+    keys = [cfg.base_url_config_key]
+    if client == "codex":
+        provider = _read_codex_model_provider()
+        if provider:
+            keys.append(f"model_providers.{provider}.base_url")
+
+    overrides: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        if not _has_config_override(args, key):
+            overrides.append(f'{key}="{base_url}"')
+    return overrides
 
 
 def _has_settings_arg(args: list[str]) -> bool:
@@ -786,6 +808,48 @@ def _read_settings_env_base_url(path: Path, env_key: str) -> str | None:
     return value or None
 
 
+def _read_toml_file(path: Path) -> dict | None:
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError, ValueError):
+        return None
+
+
+def _codex_config_path() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+
+
+def _read_codex_model_provider() -> str | None:
+    data = _read_toml_file(_codex_config_path())
+    if not isinstance(data, dict):
+        return None
+    provider = data.get("model_provider")
+    if not isinstance(provider, str):
+        return None
+    provider = provider.strip()
+    return provider or None
+
+
+def _detect_codex_provider_base_url() -> str | None:
+    data = _read_toml_file(_codex_config_path())
+    if not isinstance(data, dict):
+        return None
+    provider = data.get("model_provider")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    providers = data.get("model_providers")
+    if not isinstance(providers, dict):
+        return None
+    config = providers.get(provider.strip())
+    if not isinstance(config, dict):
+        return None
+    base_url = config.get("base_url")
+    if not isinstance(base_url, str):
+        return None
+    base_url = base_url.strip()
+    return base_url or None
+
+
 def _detect_claude_target() -> str:
     """Auto-detect the upstream target Claude Code would normally use.
 
@@ -833,6 +897,9 @@ def _detect_codex_target() -> str:
             return _CODEX_CHATGPT_TARGET
     except (OSError, json.JSONDecodeError, ValueError):
         pass
+    provider_base_url = _detect_codex_provider_base_url()
+    if provider_base_url:
+        return provider_base_url
     return CLIENT_CONFIGS["codex"].default_target
 
 

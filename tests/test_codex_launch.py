@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
 
-from claude_tap.cli import _has_config_override, _reverse_proxy_trace_options, parse_args, run_client
+from claude_tap.cli import (
+    CLIENT_CONFIGS,
+    _base_url_config_overrides,
+    _has_config_override,
+    _reverse_proxy_trace_options,
+    parse_args,
+    run_client,
+)
 
 
 class _DummyProc:
@@ -22,6 +30,13 @@ class _DummyProc:
 
     def kill(self) -> None:
         self.returncode = -9
+
+
+@pytest.fixture(autouse=True)
+def _isolate_codex_home(monkeypatch, tmp_path) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
 
 @pytest.mark.asyncio
@@ -80,6 +95,46 @@ async def test_run_client_codex_reverse_respects_existing_openai_base_override(m
 
 
 @pytest.mark.asyncio
+async def test_run_client_codex_reverse_overrides_custom_model_provider_base_url(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    codex_home = Path(os.environ["CODEX_HOME"])
+    (codex_home / "config.toml").write_text(
+        """
+model_provider = "clawd"
+
+[model_providers.clawd]
+base_url = "https://claw-d.cc/v1"
+env_key = "CLAWD_API_KEY"
+""",
+        encoding="utf-8",
+    )
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return _DummyProc()
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr("claude_tap.cli.shutil.which", lambda _: "/tmp/codex")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    code = await run_client(43123, ["exec", "hello"], client="codex", proxy_mode="reverse")
+
+    assert code == 0
+    assert captured["cmd"] == (
+        "/tmp/codex",
+        "-c",
+        'openai_base_url="http://127.0.0.1:43123/v1"',
+        "-c",
+        'model_providers.clawd.base_url="http://127.0.0.1:43123/v1"',
+        "exec",
+        "hello",
+    )
+    assert captured["env"]["OPENAI_BASE_URL"] == "http://127.0.0.1:43123/v1"
+
+
+@pytest.mark.asyncio
 async def test_run_client_codex_forward_sets_rust_tls_ca_env(monkeypatch) -> None:
     captured: dict[str, object] = {}
     ca_path = Path("/tmp/test-ca.pem")
@@ -107,15 +162,55 @@ def test_has_config_override_detects_cli_forms() -> None:
     assert _has_config_override(["exec", "hello"], "openai_base_url") is False
 
 
+def test_base_url_config_overrides_respects_existing_custom_provider_override(monkeypatch, tmp_path) -> None:
+    codex_home = Path(os.environ["CODEX_HOME"])
+    (codex_home / "config.toml").write_text(
+        """
+model_provider = "clawd"
+
+[model_providers.clawd]
+base_url = "https://claw-d.cc/v1"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    overrides = _base_url_config_overrides(
+        "codex",
+        CLIENT_CONFIGS["codex"],
+        43123,
+        ["-c", 'model_providers.clawd.base_url="http://example.invalid/v1"'],
+    )
+
+    assert overrides == ['openai_base_url="http://127.0.0.1:43123/v1"']
+
+
 def test_parse_args_codex_auto_detects_chatgpt_target(monkeypatch, tmp_path) -> None:
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
+    codex_home = Path(os.environ["CODEX_HOME"])
     (codex_home / "auth.json").write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
     args = parse_args(["--tap-client", "codex"])
 
     assert args.target == "https://chatgpt.com/backend-api/codex"
+
+
+def test_parse_args_codex_auto_detects_custom_provider_target(monkeypatch, tmp_path) -> None:
+    codex_home = Path(os.environ["CODEX_HOME"])
+    (codex_home / "config.toml").write_text(
+        """
+model_provider = "clawd"
+
+[model_providers.clawd]
+base_url = "https://claw-d.cc/v1"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    args = parse_args(["--tap-client", "codex"])
+
+    assert args.target == "https://claw-d.cc/v1"
 
 
 def test_parse_args_claude_uses_env_base_url(monkeypatch) -> None:
